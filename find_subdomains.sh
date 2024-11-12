@@ -27,3 +27,8 @@ cat subfinder_subs.txt assetfinder_subs.txt amass_subs.txt crt_subs.txt | sort -
 
 # Print the final result
 echo "Subdomain discovery complete. Results saved in subdomains.txt."
+
+# Clean up all files except subdomains.txt
+rm -f domains.txt subfinder_subs.txt assetfinder_subs.txt amass_subs.txt crt_subs.txt
+
+echo "Clean up complete. Only subdomains.txt remains."

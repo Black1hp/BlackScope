@@ -75,7 +75,7 @@ Options:
   -h, --help, -hh   Show this help page
 
 Example:
-  go run BlackScope.go -d facebook.com -v
+  go run BlackScope.go -d target.com -v
   go run BlackScope.go -f domains.txt -disable ffuf,dnscan -v
 `)
 }
@@ -93,7 +93,6 @@ func readDomainsFromFile(filePath string) ([]string, error) {
 	for scanner.Scan() {
 		domain := strings.TrimSpace(scanner.Text())
 		if domain != "" && !strings.HasPrefix(domain, "#") {
-			// Sanitize domain to prevent command injection
 			if !strings.ContainsAny(domain, "/;\"'`|&") {
 				domains = append(domains, domain)
 			} else {
@@ -107,7 +106,7 @@ func readDomainsFromFile(filePath string) ([]string, error) {
 	return domains, nil
 }
 
-// Extract base domain (e.g., dyson.no from api.dyson.no)
+// Extract base domain (e.g., example.com from sub.example.com)
 func getBaseDomain(domain string) string {
 	parts := strings.Split(domain, ".")
 	if len(parts) <= 2 {
@@ -176,7 +175,6 @@ func parseFlags() *Config {
 		os.Exit(1)
 	}
 
-	// Initialize disabled tools map
 	cfg.DisableTools = make(map[string]bool)
 	if disableTools != "" {
 		validTools := map[string]bool{
@@ -211,7 +209,6 @@ func parseFlags() *Config {
 			os.Exit(1)
 		}
 	} else {
-		// Sanitize single domain
 		if strings.ContainsAny(cfg.Domain, "/;\"'`|&") {
 			fmt.Println("Invalid domain format. Use example.com")
 			os.Exit(1)
@@ -222,7 +219,7 @@ func parseFlags() *Config {
 	return &cfg
 }
 
-// Execute a shell command
+// Execute a shell command with enhanced error handling
 func runCommand(cmdStr string, cfg *Config) {
 	if cfg.Verbose {
 		fmt.Println("[RUNNING] ", cmdStr)
@@ -234,9 +231,23 @@ func runCommand(cmdStr string, cfg *Config) {
 	} else if cfg.Verbose {
 		fmt.Println("[OUTPUT] ", string(output))
 	}
-	// Log empty output for debugging
 	if len(output) == 0 && err == nil {
 		logError(fmt.Sprintf("Command produced no output: %s", cmdStr))
+	}
+	parts := strings.Fields(cmdStr)
+	var outputFile string
+	for i, part := range parts {
+		if part == ">" && i+1 < len(parts) {
+			outputFile = parts[i+1]
+			break
+		}
+	}
+	if outputFile != "" {
+		if stat, err := os.Stat(outputFile); err == nil && stat.Size() == 0 {
+			logError(fmt.Sprintf("Output file is empty: %s", outputFile))
+		} else if err != nil && os.IsNotExist(err) {
+			logError(fmt.Sprintf("Output file not created: %s", outputFile))
+		}
 	}
 }
 
@@ -248,6 +259,8 @@ func reconDomain(domain string, cfg *Config) {
 
 	// Extract base domain for filtering
 	baseDomain := getBaseDomain(domain)
+	// Escape dots for regex
+	baseDomainRegex := strings.ReplaceAll(baseDomain, ".", "\\.")
 
 	var wg sync.WaitGroup
 
@@ -269,15 +282,16 @@ func reconDomain(domain string, cfg *Config) {
 		tools = append(tools, fmt.Sprintf("python3 ~/black1hp/Sublist3r/sublist3r.py -d %s -o %s/sublist3r.txt", domain, dir))
 	}
 	if !cfg.DisableTools["crtsh"] {
-		// Save raw crt.sh output for debugging
-		tools = append(tools, fmt.Sprintf(`curl -s "https://crt.sh/?q=%s&output=json" > %s/crt_raw.json`, baseDomain, dir))
-		tools = append(tools, fmt.Sprintf(`cat %s/crt_raw.json | jq -r '.[] | select(.name_value | type == "string") | .name_value | select(. | test("dev|api|test|stage"; "i"))' | sort -u > %s/crt.txt`, dir, dir))
+		tools = append(tools, fmt.Sprintf(`curl -s -w "%%{http_code}" "https://crt.sh/?q=%s&output=json" > %s/crt_raw.json`, baseDomain, dir))
+		tools = append(tools, fmt.Sprintf(`cat %s/crt_raw.json | grep -v "^000" | jq -r '.[] | select(.name_value | type == "string") | .name_value | select(. | test("dev|api|test|stage"; "i"))' | sort -u > %s/crt.txt || cat %s/crt_raw.json | grep -v "^000" | jq -r '.[] | select(.name_value | type == "string") | .name_value' | sort -u > %s/crt.txt`, dir, dir, dir, dir))
+		// Fallback to CertSpotter
+		tools = append(tools, fmt.Sprintf(`[ -s %s/crt.txt ] || curl -s "https://api.certspotter.com/v1/issuances?domain=%s&include_subdomains=true&expand=dns_names" | jq -r '.[].dns_names[]' | sort -u > %s/certspotter.txt`, dir, baseDomain, dir))
 	}
 	if !cfg.DisableTools["dnscan"] {
-		tools = append(tools, fmt.Sprintf("python3 ~/black1hp/dnscan/dnscan.py -d %s -q -w %s -t %d | tee %s/bruteforce-dnscan.txt", domain, cfg.Wordlist, cfg.Threads, dir))
+		tools = append(tools, fmt.Sprintf("python3 ~/black1hp/dnscan/dnscan.py -d %s -w %s -t %d | tee %s/bruteforce-dnscan.txt", domain, cfg.Wordlist, cfg.Threads, dir))
 	}
 	if !cfg.DisableTools["ffuf"] {
-		tools = append(tools, fmt.Sprintf(`ffuf -H "Host: FUZZ.%s" -u https://%s/ -w %s -mc 200,302 -o %s/vhosts.json`, domain, domain, cfg.Wordlist, dir))
+		tools = append(tools, fmt.Sprintf(`ffuf -H "Host: FUZZ.%s" -u https://%s/ -w %s -mc 200,302 -o %s/vhosts.json -noninteractive`, domain, domain, cfg.Wordlist, dir))
 	}
 
 	for _, c := range tools {
@@ -289,31 +303,91 @@ func reconDomain(domain string, cfg *Config) {
 	}
 	wg.Wait()
 
+	// Explicitly list input files for raw_subs.txt
+	inputFiles := []string{
+		"subfinder.txt",
+		"amass.txt",
+		"assetfinder.txt",
+		"findomain.txt",
+		"sublist3r.txt",
+		"crt.txt",
+		"certspotter.txt",
+		"bruteforce-dnscan.txt",
+		"vhosts.hosts",
+	}
+	var validFiles []string
+	for _, file := range inputFiles {
+		path := filepath.Join(dir, file)
+		if stat, err := os.Stat(path); err == nil && stat.Size() > 0 {
+			validFiles = append(validFiles, path)
+			logError BESOIN D'UN FICHIER
+logError(fmt.Sprintf("Input file for raw_subs.txt: %s (%d bytes)", path, stat.Size()))
+		}
+	}
+
 	// Sequential post-processing
 	sequential := []string{}
 	if !cfg.DisableTools["dnscan"] {
 		sequential = append(sequential,
-			fmt.Sprintf(`grep -E 'Wildcard domain found' %s/bruteforce-dnscan.txt > %s/wildcards.txt`, dir, dir),
-			fmt.Sprintf(`grep -vE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|^\\*|^\\[\\*\\]|^\\[-\\]' %s/bruteforce-dnscan.txt > %s/bruteforce_subs.txt`, dir, dir),
+			fmt.Sprintf(`[ -f %s/bruteforce-dnscan.txt ] && grep -E 'Wildcard domain found' %s/bruteforce-dnscan.txt > %s/wildcards.txt || echo "No dnscan output" > %s/wildcards.txt`, dir, dir, dir, dir),
+			fmt.Sprintf(`[ -f %s/bruteforce-dnscan.txt ] && grep -vE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|^\\*|^\\[\\*\\]|^\\[-\\]' %s/bruteforce-dnscan.txt > %s/bruteforce_subs.txt || touch %s/bruteforce_subs.txt`, dir, dir, dir, dir),
 		)
 	}
 	if !cfg.DisableTools["ffuf"] {
 		sequential = append(sequential,
-			fmt.Sprintf(`jq -r '.results[].host' %s/vhosts.json | sort -u > %s/vhosts.hosts`, dir, dir),
+			fmt.Sprintf(`[ -f %s/vhosts.json ] && jq -r '.results[].host' %s/vhosts.json | sort -u > %s/vhosts.hosts || touch %s/vhosts.hosts`, dir, dir, dir, dir),
+		)
+	}
+	// Aggregate subdomains explicitly
+	if len(validFiles) > 0 {
+		sequential = append(sequential,
+			fmt.Sprintf(`cat %s 2>/dev/null > %s/raw_subs.txt`, strings.Join(validFiles, " "), dir),
+			fmt.Sprintf(`[ -s %s/raw_subs.txt ] && cat %s/raw_subs.txt | grep -vE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|^\\*|^\\[\\*\\]|^\\[-\\]' | grep -E '^[a-zA-Z0-9][a-zA-Z0-9.-]*\\.%s$' | sort -u > %s/all_subs.txt || touch %s/all_subs.txt`, dir, dir, baseDomainRegex, dir, dir),
+		)
+	} else {
+		sequential = append(sequential,
+			fmt.Sprintf(`touch %s/raw_subs.txt`, dir),
+			fmt.Sprintf(`touch %s/all_subs.txt`, dir),
 		)
 	}
 	sequential = append(sequential,
-		fmt.Sprintf(`cat %s/*.txt %s/*.hosts %s/bruteforce_subs.txt 2>/dev/null > %s/raw_subs.txt`, dir, dir, dir, dir),
-		fmt.Sprintf(`cat %s/raw_subs.txt | grep -vE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|^\\*|^\\[\\*\\]|^\\[-\\]' | grep -E '^[a-zA-Z0-9][a-zA-Z0-9.-]*\.'"%s"'$' | sort -u > %s/all_subs.txt`, dir, baseDomain, dir),
-		fmt.Sprintf(`dnsgen %s/all_subs.txt -w %s | grep -E '^[a-zA-Z0-9][a-zA-Z0-9.-]*\.'"%s"'$' | sort -u > %s/permuted_subs.txt`, dir, cfg.Wordlist, baseDomain, dir),
-		fmt.Sprintf(`dnsx -l %s/permuted_subs.txt -resp -o %s/resolved_subs.txt`, dir, dir),
-		fmt.Sprintf(`awk -F' - ' '{if (NF > 1) print $2; else print $1}' %s/resolved_subs.txt > %s/resolved_domains.txt`, dir, dir),
-		fmt.Sprintf(`cat %s/resolved_subs.txt > %s/resolved_ips_and_domains.txt`, dir, dir),
+		fmt.Sprintf(`[ -s %s/all_subs.txt ] && dnsgen %s/all_subs.txt -w %s | grep -E '^[a-zA-Z0-9][a-zA-Z0-9.-]*\\.%s$' | sort -u > %s/permuted_subs.txt || touch %s/permuted_subs.txt`, dir, dir, cfg.Wordlist, baseDomainRegex, dir, dir),
+		fmt.Sprintf(`[ -s %s/permuted_subs.txt ] && dnsx -l %s/permuted_subs.txt -resp -o %s/resolved_subs.txt || touch %s/resolved_subs.txt`, dir, dir, dir, dir),
+		fmt.Sprintf(`[ -s %s/resolved_subs.txt ] && awk -F' - ' '{if (NF > 1) print $2; else print $1}' %s/resolved_subs.txt > %s/resolved_domains.txt || touch %s/resolved_domains.txt`, dir, dir, dir, dir),
+		fmt.Sprintf(`[ -s %s/resolved_subs.txt ] && cat %s/resolved_subs.txt > %s/resolved_ips_and_domains.txt || touch %s/resolved_ips_and_domains.txt`, dir, dir, dir, dir),
 		fmt.Sprintf(`wc -l %s/all_subs.txt`, dir),
 	)
 
 	for _, c := range sequential {
 		runCommand(c, cfg)
+	}
+
+	// Log which tools produced output
+	for _, file := range inputFiles {
+		path := filepath.Join(dir, file)
+		if stat, err := os.Stat(path); err == nil && stat.Size() > 0 {
+			logError(fmt.Sprintf("Tool output found: %s (%d bytes)", path, stat.Size()))
+		} else if err == nil {
+			logError(fmt.Sprintf("Tool output empty: %s", path))
+		} else {
+			logError(fmt.Sprintf("Tool output missing: %s", path))
+		}
+	}
+
+	// Summary of subdomains
+	summaryFile := filepath.Join(dir, "summary.txt")
+	f, err := os.Create(summaryFile)
+	if err != nil {
+		logError(fmt.Sprintf("Failed to create summary file: %v", err))
+	}
+	defer f.Close()
+	subsFile := filepath.Join(dir, "all_subs.txt")
+	if stat, err := os.Stat(subsFile); err == nil && stat.Size() > 0 {
+		cmd := exec.Command("bash", "-c", fmt.Sprintf(`wc -l %s`, subsFile))
+		output, _ := cmd.CombinedOutput()
+		f.WriteString(fmt.Sprintf("Domain: %s, Total subdomains: %s", domain, string(output)))
+	} else {
+		f.WriteString(fmt.Sprintf("Domain: %s, No subdomains found\n", domain))
 	}
 
 	fmt.Println("Recon completed for", domain, ". Results saved in", dir)

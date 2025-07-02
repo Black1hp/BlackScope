@@ -320,8 +320,7 @@ func reconDomain(domain string, cfg *Config) {
 		path := filepath.Join(dir, file)
 		if stat, err := os.Stat(path); err == nil && stat.Size() > 0 {
 			validFiles = append(validFiles, path)
-			logError BESOIN D'UN FICHIER
-logError(fmt.Sprintf("Input file for raw_subs.txt: %s (%d bytes)", path, stat.Size()))
+			logError(fmt.Sprintf("Input file for raw_subs.txt: %s (%d bytes)", path, stat.Size()))
 		}
 	}
 

@@ -1,6 +1,6 @@
 # BlackScope - Subdomain Recon & Discovery Toolkit
 
-![BlackScope Banner](https://via.placeholder.com/800x200.png?text=BlackScope+Subdomain+Recon)
+![BlackScope Banner](https://github.com/Black1hp/BlackScope/blob/main/image.png?raw=true)
 
 **BlackScope** is a powerful, multi-threaded subdomain reconnaissance and discovery toolkit crafted for bug bounty hunters, penetration testers, and red teamers. It automates subdomain enumeration for a target domain or a list of domains, leveraging popular tools like `subfinder`, `amass`, `assetfinder`, `findomain`, `sublist3r`, `crt.sh`, `dnscan`, and `ffuf`. BlackScope aggregates results, filters invalid entries, handles wildcard DNS records, and resolves subdomains with IP addresses, making it an essential tool for reconnaissance in authorized security testing environments such as bug bounty programs, CTFs, or personal labs.
 

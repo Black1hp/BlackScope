@@ -1,5 +1,7 @@
-// BlackScope — Subdomain Recon & Discovery Toolkit v3.1
+// BlackScope — Subdomain Recon & Discovery Toolkit v3.2
 // Author: Black1hp | github.com/black1hp
+//
+// Optimized Version: Single-pass DNSX w/JSON, efficient deduplication, modern post-processing
 // Features: Bulk mode, per-command timing/debugging, full passive/active recon, AlterX, clean output
 
 package main
@@ -17,8 +19,6 @@ import (
         "time"
 )
 
-/* ---------------------------- configuration ---------------------------- */
-
 type Config struct {
         Domain, DomainFile, Wordlist, Output string
         Threads, MaxConcurrent               int
@@ -30,7 +30,7 @@ var (
         debugLog *os.File
 )
 
-/* ---------------------------- helpers ---------------------------- */
+/* ---------------------------- Logging ---------------------------- */
 
 func initLogs() {
         var err error
@@ -56,9 +56,9 @@ __________.__                 __      _________
  |______  /____(____  /\___  >__|_ \/_______  /\___  >____/|   __/ \___  >
         \/          \/     \/     \/        \/     \/      |__|        \/
 
-        BlackScope — Subdomain Recon & Discovery Toolkit v3.1
-        Author: Black1hp | github.com/black1hp
-        Bulk mode • Per-command timing/debugging • AlterX permutations
+            BlackScope — Subdomain Recon & Discovery Toolkit v3.2
+            Author: Black1hp | github.com/black1hp
+            Optimized: Single-pass DNSX, dedup-first approach
 `)
 }
 
@@ -84,7 +84,7 @@ Examples:
 `)
 }
 
-/* ---------------------------- flags ---------------------------- */
+/* ---------------------------- Flags ---------------------------- */
 
 func parseFlags() *Config {
         var cfg Config
@@ -125,7 +125,7 @@ func parseFlags() *Config {
         return &cfg
 }
 
-/* ---------------------------- domain file processing ---------------------------- */
+/* ------------------------ Domain File Loader ------------------------ */
 
 func readDomainsFromFile(filename string) ([]string, error) {
         file, err := os.Open(filename)
@@ -157,7 +157,7 @@ func readDomainsFromFile(filename string) ([]string, error) {
         return domains, nil
 }
 
-/* ---------------------------- core execution functions ---------------------------- */
+/* ------------------------ Helpers and Exec ------------------------ */
 
 func runCommand(cmd string, v bool, domain string) {
         if v {
@@ -177,6 +177,7 @@ func runCommand(cmd string, v bool, domain string) {
         }
 }
 
+// Cleans and dedups found subs for a given domain
 func cleanSubdomainFile(in, out, domain string) error {
         r, err := os.Open(in)
         if err != nil {
@@ -195,7 +196,6 @@ func cleanSubdomainFile(in, out, domain string) error {
                 if line == "" || strings.HasPrefix(line, "#") {
                         continue
                 }
-                // Strip leading "IP - " if present
                 if idx := strings.Index(line, " - "); idx != -1 &&
                         strings.Count(line[:idx], ".") == 3 &&
                         line[0] >= '0' && line[0] <= '9' {
@@ -212,7 +212,7 @@ func cleanSubdomainFile(in, out, domain string) error {
         return sc.Err()
 }
 
-/* ---------------------------- single domain recon ---------------------------- */
+/* ---------------------------- Core Recon ---------------------------- */
 
 func reconSingleDomain(domain string, cfg *Config) (int, error) {
         if cfg.Verbose {
@@ -239,26 +239,48 @@ func reconSingleDomain(domain string, cfg *Config) (int, error) {
                 }(c)
         }
         wg.Wait()
-        runCommand(fmt.Sprintf(`ffuf -s -H "Host: FUZZ.%s" -u https://%s/ -w %s -mc 200,301,302 -o %s/vhosts.json`,
+
+        // FFUF virtual host brute
+        runCommand(fmt.Sprintf(
+                `ffuf -s -H "Host: FUZZ.%s" -u https://%s/ -w %s -mc 200,301,302 -o %s/vhosts.json`,
                 domain, domain, cfg.Wordlist, outDir), cfg.Verbose, domain)
-        runCommand(fmt.Sprintf(`find %[1]s -name "*.txt" -exec cat {} \; > %[1]s/all_raw.txt && \
-                jq -r '.results[]?.host // empty' %[1]s/vhosts.json >> %[1]s/all_raw.txt 2>/dev/null || true`, outDir), cfg.Verbose, domain)
+        runCommand(fmt.Sprintf(
+                `find %[1]s -name "*.txt" -exec cat {} \; > %[1]s/all_raw.txt && jq -r '.results[]?.host // empty' %[1]s/vhosts.json >> %[1]s/all_raw.txt 2>/dev/null || true`,
+                outDir), cfg.Verbose, domain)
+
+        // Clean + dedup to all_subs.txt
         if err := cleanSubdomainFile(filepath.Join(outDir, "all_raw.txt"),
                 filepath.Join(outDir, "all_subs.txt"), domain); err != nil {
                 logError("cleaning error: " + err.Error())
         }
+        runCommand(fmt.Sprintf(`sort -u %s/all_subs.txt -o %s/all_subs.txt`, outDir, outDir), cfg.Verbose, domain)
+
+        // Permute -- then dedup permuted subs
         alterx := "/root/go/bin/alterx"
         if _, err := exec.LookPath(alterx); err != nil {
                 alterx = "alterx"
         }
         runCommand(fmt.Sprintf(`%s -l %s/all_subs.txt -en -o %s/permuted_subs.txt 2>/dev/null || echo "AlterX failed" > %s/alterx_error.log`,
                 alterx, outDir, outDir, outDir), cfg.Verbose, domain)
-        runCommand(fmt.Sprintf(`dnsx -silent -l %s/permuted_subs.txt -o %s/resolved_subs.txt 2>/dev/null || true`, outDir, outDir), cfg.Verbose, domain)
-        runCommand(fmt.Sprintf(`dnsx -silent -ro -l %s/permuted_subs.txt -o %s/resolved_ips.txt 2>/dev/null || true`, outDir, outDir), cfg.Verbose, domain)
-        runCommand(fmt.Sprintf(`cat %s/resolved_subs.txt >> %s/all_subs.txt 2>/dev/null && \
-                sort -u %s/all_subs.txt -o %s/all_subs.txt || true`, outDir, outDir, outDir, outDir), cfg.Verbose, domain)
-        runCommand(fmt.Sprintf(`cat %s/resolved_ips.txt > %s/ip_list.txt 2>/dev/null || touch %s/ip_list.txt`, outDir, outDir, outDir), cfg.Verbose, domain)
-        runCommand(fmt.Sprintf(`sed -i 's/^\([0-9]\{1,3\}\.\)\{3\}[0-9]\{1,3\} - //' %s/all_subs.txt 2>/dev/null || true`, outDir), cfg.Verbose, domain)
+        runCommand(fmt.Sprintf(`sort -u %s/permuted_subs.txt -o %s/permuted_subs.txt`, outDir, outDir), cfg.Verbose, domain)
+
+        // 🚀 SINGLE JSON DNSX RUN
+        runCommand(fmt.Sprintf(
+                `dnsx -silent -json -l %s/permuted_subs.txt -o %s/resolved_dnsx.json 2>/dev/null || true`,
+                outDir, outDir), cfg.Verbose, domain)
+
+        // Extract all resolved subdomains and IPs using jq
+        runCommand(fmt.Sprintf(
+                `jq -r '.host' %s/resolved_dnsx.json | sort -u > %s/resolved_subs.txt`, outDir, outDir), cfg.Verbose, domain)
+        runCommand(fmt.Sprintf(
+                `jq -r '.a[]?' %s/resolved_dnsx.json | sort -u > %s/ip_list.txt`, outDir, outDir), cfg.Verbose, domain)
+
+        // Combine, dedup for reporting
+        runCommand(fmt.Sprintf(
+                `cat %s/resolved_subs.txt >> %s/all_subs.txt && sort -u %s/all_subs.txt -o %s/all_subs.txt`,
+                outDir, outDir, outDir, outDir), cfg.Verbose, domain)
+
+        // Output stats
         allSubsFile := filepath.Join(outDir, "all_subs.txt")
         count := 0
         if file, err := os.Open(allSubsFile); err == nil {
@@ -276,7 +298,7 @@ func reconSingleDomain(domain string, cfg *Config) (int, error) {
         return count, nil
 }
 
-/* ---------------------------- bulk processing ---------------------------- */
+/* ---------------------- Bulk Processing ---------------------- */
 
 type DomainResult struct {
         Domain string
@@ -329,7 +351,7 @@ func generateSummary(outputDir string, domains []string, successful, failed, tot
                 return
         }
         defer file.Close()
-        fmt.Fprintf(file, "BlackScope v3.1 - Bulk Processing Summary\n")
+        fmt.Fprintf(file, "BlackScope v3.2 - Bulk Processing Summary\n")
         fmt.Fprintf(file, "========================================\n\n")
         fmt.Fprintf(file, "Total domains processed: %d\n", len(domains))
         fmt.Fprintf(file, "Successful: %d\n", successful)
@@ -350,7 +372,7 @@ func generateSummary(outputDir string, domains []string, successful, failed, tot
         fmt.Printf("   Summary saved: %s\n", summaryFile)
 }
 
-/* ---------------------------- main execution ---------------------------- */
+/* --------------------------- Main ---------------------------- */
 
 func main() {
         banner()
